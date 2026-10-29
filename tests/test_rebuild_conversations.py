@@ -491,5 +491,70 @@ class DatabaseSyncTests(unittest.TestCase):
             self.assertFalse(os.path.exists(path_b))
 
 
+class DatabaseTimestampTests(unittest.TestCase):
+    def test_extract_conversation_db_timestamp_from_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "test.db")
+            target_ts = 1722100000
+            ts_payload = fix.encode_varint((1 << 3) | 0) + fix.encode_varint(target_ts)
+            meta = fix.encode_length_delimited(1, ts_payload)
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "CREATE TABLE conversation_steps (idx INTEGER NOT NULL, step_type INTEGER NOT NULL, step_payload BLOB, metadata BLOB)"
+            )
+            conn.execute("INSERT INTO conversation_steps (idx, step_type, metadata) VALUES (1, 1, ?)", (meta,))
+            conn.commit()
+            conn.close()
+
+            ts = fix.extract_conversation_db_timestamp(db_path)
+            self.assertEqual(ts, target_ts)
+
+    def test_extract_conversation_db_timestamp_handles_missing_and_corrupt(self):
+        self.assertIsNone(fix.extract_conversation_db_timestamp("nonexistent.db"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bad_path = os.path.join(temp_dir, "bad.db")
+            with open(bad_path, "wb") as f:
+                f.write(b"not sqlite")
+            self.assertIsNone(fix.extract_conversation_db_timestamp(bad_path))
+
+    def test_get_conversation_effective_timestamp_prefers_exact_time(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "test.db")
+            target_ts = 1722100000
+            ts_payload = fix.encode_varint((1 << 3) | 0) + fix.encode_varint(target_ts)
+            meta = fix.encode_length_delimited(1, ts_payload)
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "CREATE TABLE conversation_steps (idx INTEGER NOT NULL, step_type INTEGER NOT NULL, step_payload BLOB, metadata BLOB)"
+            )
+            conn.execute("INSERT INTO conversation_steps (idx, step_type, metadata) VALUES (1, 1, ?)", (meta,))
+            conn.commit()
+            conn.close()
+
+            os.utime(db_path, (1790000000, 1790000000))
+            ts, is_exact = fix.get_conversation_effective_timestamp(db_path)
+            self.assertTrue(is_exact)
+            self.assertEqual(ts, target_ts)
+
+    def test_build_trajectory_entry_exact_db_time_overrides_newer_corrupt_timestamp(self):
+        existing = (
+            fix.encode_string_field(1, "Old title")
+            + fix.build_timestamp_field(3, 1790000000)
+            + fix.build_timestamp_field(10, 1790000000)
+        )
+        real_time = 1722100000
+        entry = fix.build_trajectory_entry(
+            "cid-123",
+            "New title",
+            existing,
+            conversation_mtime=real_time,
+            source_is_db=True,
+            exact_db_time=True,
+        )
+        inner = entry_inner_blob(entry)
+        self.assertEqual(fix.extract_timestamp_seconds(inner, 3), real_time)
+        self.assertEqual(fix.extract_timestamp_seconds(inner, 10), real_time)
+
+
 if __name__ == "__main__":
     unittest.main()

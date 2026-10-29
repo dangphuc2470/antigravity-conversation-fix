@@ -35,8 +35,8 @@ Your Antigravity conversation history disappeared? Conversations showing in the 
 | Placeholder titles despite usable conversation text | ✅ Derives titles from the first `.db` user prompt *(v1.07+)* |
 | Recent `.db` messages disappear from the sidebar later | ✅ Refreshes updated timestamps on re-run *(v1.07+)* |
 | Running from WSL requires manual file copying | ✅ Native WSL path detection *(v1.05+)* |
-| `python` command fails on macOS/Linux | ✅ Auto-detects Python 3, with built-in fallback *(v1.05+)* |
-| History cut off after upgrading or downgrading Antigravity versions | ✅ Cross-folder database synchronization *(v1.08+)* |
+| History cut off after upgrading or downgrading Antigravity versions | Yes, cross-folder database synchronization *(v1.08+)* |
+| Conversations showing 'now' due to copied/reset file timestamps (e.g. macOS) | Yes, recovers ground-truth timestamps from SQLite step metadata *(v1.08+)* |
 
 ## How It Works
 
@@ -77,7 +77,8 @@ When the index gets corrupted, conversations still exist on disk but don't show 
 
 ### v1.08
 - **New:** **Cross-folder conversation database sync** — when switching or downgrading between Antigravity versions (e.g. 2.5.5 in `antigravity-ide` vs 2.6.0+ in `antigravity`), conversations often end up split across multiple folders with divergent step counts. The tool now inspects conversation databases across all discovered locations, identifies the copy with the most progress (highest step index/count), and safely synchronizes it to other folders using SQLite backup APIs, creating rollback backups (`.bak`).
-- **Tests:** Added comprehensive test coverage for database step inspection, atomic SQLite backup, WAL consolidation, and multi-folder synchronization (including dry-run validation).
+- **Fix:** **Ground-truth timestamp recovery** — when files are transferred, restored, or cloned across platforms (especially macOS), filesystem modification times often reset to the current time, causing every conversation in the sidebar to erroneously show as "now". The tool now extracts authentic timestamps directly from step protobuf metadata inside `.db` files, correctly sorting conversations by their original activity date and resetting any previous corrupt timestamps.
+- **Tests:** Added comprehensive test coverage for database step inspection, atomic SQLite backup, WAL consolidation, multi-folder synchronization, and ground-truth timestamp extraction.
 
 ### v1.07
 - **Fix:** **Meaningful `.db` titles** — derives a concise title from the first user prompt when neither the existing index nor brain artifacts contain a title, replacing many date-and-ID placeholders.

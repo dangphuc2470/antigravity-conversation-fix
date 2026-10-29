@@ -1058,7 +1058,7 @@ def _find_step_table(conn):
             row[1]
             for row in conn.execute("PRAGMA table_info(" + quoted + ")").fetchall()
         }
-        if {"step_type", "step_payload"}.issubset(columns):
+        if "step_type" in columns and ("step_payload" in columns or "metadata" in columns):
             return quoted, "idx" in columns
     return None, False
 
@@ -1209,6 +1209,81 @@ def inspect_conversation_db(db_path):
     finally:
         if conn is not None:
             conn.close()
+
+
+def extract_conversation_db_timestamp(db_path):
+    """
+    Extract the real creation/update timestamp (in epoch seconds) from the
+    latest step inside a conversation SQLite database.
+
+    This bypasses filesystem mtime which is frequently corrupted or reset
+    to 'now' when copying, restoring, or cloning files across platforms
+    (especially on macOS).
+    """
+    if not os.path.isfile(db_path):
+        return None
+    conn = None
+    try:
+        conn = _open_sqlite_readonly(db_path)
+        table, has_idx = _find_step_table(conn)
+        if not table:
+            return None
+
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(" + table + ")").fetchall()
+        }
+        order = "ORDER BY " + _quote_sqlite_identifier("idx") + " DESC" if has_idx else "ORDER BY rowid DESC"
+
+        target_col = "metadata" if "metadata" in columns else "step_payload"
+        cursor = conn.execute(
+            f"SELECT {target_col} FROM {table} WHERE {target_col} IS NOT NULL {order} LIMIT 15"
+        )
+        for row in cursor.fetchall():
+            blob = row[0]
+            if isinstance(blob, memoryview):
+                blob = blob.tobytes()
+            if not isinstance(blob, bytes) or not blob:
+                continue
+
+            for sub in iter_length_delimited_fields(blob, 1):
+                pos = 0
+                while pos < len(sub):
+                    tag, pos = decode_varint(sub, pos)
+                    fn, wt = tag >> 3, tag & 7
+                    if fn == 1 and wt == 0:
+                        sec, pos = decode_varint(sub, pos)
+                        if 1500000000 < sec < 2500000000:
+                            return sec
+                    else:
+                        pos = skip_protobuf_field(sub, pos, wt)
+                        if pos <= 0:
+                            break
+        return None
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def get_conversation_effective_timestamp(conv_path):
+    """
+    Get the most accurate timestamp for a conversation file.
+    For .db files, extracts the real timestamp from internal steps to avoid
+    filesystem mtime resets (e.g. file copied/restored on macOS showing 'now').
+    Returns (timestamp_seconds, is_exact_db_time).
+    """
+    if not conv_path or not os.path.exists(conv_path):
+        return None, False
+    if conv_path.lower().endswith(".db"):
+        ts = extract_conversation_db_timestamp(conv_path)
+        if ts is not None and ts > 0:
+            return ts, True
+    try:
+        return int(os.path.getmtime(conv_path)), False
+    except OSError:
+        return None, False
 
 
 def copy_conversation_db(src_path, dst_path):
@@ -1578,7 +1653,7 @@ def resolve_title(conversation_id, existing_titles, conversation_path=None):
 
 def build_trajectory_entry(conversation_id, title, existing_inner_data=None,
                            workspace_path=None, conversation_mtime=None,
-                           source_is_db=False):
+                           source_is_db=False, exact_db_time=False):
     """
     Build a single trajectory summary protobuf entry.
 
@@ -1586,8 +1661,9 @@ def build_trajectory_entry(conversation_id, title, existing_inner_data=None,
       ALL other fields (workspace, timestamps, tool state) are preserved.
     - If workspace_path is provided and there is no existing workspace,
       a workspace field (field 9) is injected.
-    - Existing .db entries refresh only updated-at field 3 when the source file
-      is newer. Existing .pb entries retain their current timestamps.
+    - Existing .db entries refresh updated-at field 3 when the source file
+      is newer or when exact_db_time is provided (from SQLite step metadata).
+      Existing .pb entries retain their current timestamps.
     - New entries receive timestamp fields 3, 7, and 10 from the source mtime.
     """
     if existing_inner_data:
@@ -1610,10 +1686,21 @@ def build_trajectory_entry(conversation_id, title, existing_inner_data=None,
             inner_info = strip_field_from_protobuf(inner_info, 9)
             inner_info += build_workspace_field(workspace_path)
         if source_is_db and conversation_mtime:
-            indexed_mtime = extract_timestamp_seconds(existing_inner_data, 3)
-            if indexed_mtime is None or int(conversation_mtime) > indexed_mtime:
+            if exact_db_time:
+                # Force exact timestamp from SQLite step metadata
+                # This fixes 'now' display caused by reset mtime on macOS or previous runs
                 inner_info = strip_field_from_protobuf(inner_info, 3)
                 inner_info += build_timestamp_field(3, conversation_mtime)
+                # Also reset field 10 (last_modified_at) if it was stamped with a future/corrupt timestamp
+                indexed_f10 = extract_timestamp_seconds(existing_inner_data, 10)
+                if indexed_f10 is not None and indexed_f10 > int(conversation_mtime):
+                    inner_info = strip_field_from_protobuf(inner_info, 10)
+                    inner_info += build_timestamp_field(10, conversation_mtime)
+            else:
+                indexed_mtime = extract_timestamp_seconds(existing_inner_data, 3)
+                if indexed_mtime is None or int(conversation_mtime) > indexed_mtime:
+                    inner_info = strip_field_from_protobuf(inner_info, 3)
+                    inner_info += build_timestamp_field(3, conversation_mtime)
         elif conversation_mtime and not has_timestamp_fields(existing_inner_data):
             inner_info += build_timestamp_fields(conversation_mtime)
     else:
@@ -1778,10 +1865,16 @@ def main():
         print("  No conversations found on disk. Nothing to fix.")
         return 0
 
+    # Cache effective timestamps (epoch_seconds, is_exact_db_time)
+    effective_timestamps = {
+        cid: get_conversation_effective_timestamp(p)
+        for cid, p in conv_catalog.items()
+    }
+
     # Sort by modification time (newest first)
     conversation_ids = sorted(
         conv_catalog.keys(),
-        key=lambda cid: os.path.getmtime(conv_catalog[cid]),
+        key=lambda cid: (effective_timestamps[cid][0] or 0),
         reverse=True,
     )
 
@@ -1899,9 +1992,8 @@ def main():
     for cid, title, source, inner_data, has_ws in resolved:
         ws_path = ws_assignments.get(cid)
         conversation_path = conv_catalog.get(cid)
-        conversation_mtime = (
-            os.path.getmtime(conversation_path)
-            if conversation_path and os.path.exists(conversation_path) else None
+        conversation_mtime, exact_db_time = effective_timestamps.get(
+            cid, (None, False)
         )
         source_is_db = bool(
             conversation_path and conversation_path.lower().endswith(".db")
@@ -1909,7 +2001,7 @@ def main():
         old_timestamp = extract_timestamp_seconds(inner_data, 3) if inner_data else None
 
         entry = build_trajectory_entry(
-            cid, title, inner_data, ws_path, conversation_mtime, source_is_db
+            cid, title, inner_data, ws_path, conversation_mtime, source_is_db, exact_db_time
         )
         result_bytes += encode_length_delimited(1, entry)
 
@@ -1917,7 +2009,7 @@ def main():
             ws_total += 1
         if conversation_mtime and (
             not inner_data
-            or (source_is_db and (old_timestamp is None or int(conversation_mtime) > old_timestamp))
+            or (source_is_db and (exact_db_time or old_timestamp is None or int(conversation_mtime) > old_timestamp))
             or (not source_is_db and not has_timestamp_fields(inner_data))
         ):
             ts_updated += 1
