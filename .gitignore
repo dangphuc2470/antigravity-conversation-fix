@@ -20,3 +20,6 @@ env/
 .idea/
 .vscode/
 *.code-workspace
+
+# Local run backups
+trajectorySummaries_backup_*.txt

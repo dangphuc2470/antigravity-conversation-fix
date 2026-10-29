@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Antigravity Conversation Fix  (v1.07)
+Antigravity Conversation Fix  (v1.08)
 =============================
 Rebuilds the Antigravity conversation index so all your chat history
 appears correctly — sorted by date (newest first) with proper titles.
 
 Fixes:
   - Missing conversations in the sidebar
+  - Disconnected history after upgrading/downgrading across versions
   - Wrong ordering (not sorted by date)
   - Missing/placeholder titles
   - Workspace assignments stripped or lost
@@ -61,7 +62,7 @@ import webbrowser
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import urlopen, Request
 
-_CURRENT_VERSION = "1.07"
+_CURRENT_VERSION = "1.08"
 _GITHUB_REPO = "FutureisinPast/antigravity-conversation-fix"
 _RELEASES_URL = f"https://github.com/{_GITHUB_REPO}/releases/latest"
 
@@ -1177,6 +1178,178 @@ def extract_title_from_conversation_db(db_path):
     return format_prompt_title(extract_prompt_from_conversation_db(db_path))
 
 
+def inspect_conversation_db(db_path):
+    """
+    Return (step_count, max_idx) from an existing conversation SQLite database.
+    Opened read-only to avoid side effects. Returns (0, -1) on failure.
+    """
+    if not os.path.isfile(db_path):
+        return 0, -1
+    conn = None
+    try:
+        conn = _open_sqlite_readonly(db_path)
+        table, has_idx = _find_step_table(conn)
+        if not table:
+            return 0, -1
+        if has_idx:
+            row = conn.execute(
+                "SELECT COUNT(*), MAX(" + _quote_sqlite_identifier("idx") + ") FROM " + table
+            ).fetchone()
+            if row:
+                count = row[0] or 0
+                max_idx = row[1] if row[1] is not None else -1
+                return count, max_idx
+        else:
+            row = conn.execute("SELECT COUNT(*) FROM " + table).fetchone()
+            if row:
+                return row[0] or 0, -1
+        return 0, -1
+    except (OSError, sqlite3.Error):
+        return 0, -1
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def copy_conversation_db(src_path, dst_path):
+    """
+    Safely copy a conversation database using SQLite backup API.
+    Consolidates any WAL entries so the destination is clean and standalone.
+    Creates a destination backup (.bak) if an older file was replaced.
+    """
+    if not os.path.isfile(src_path):
+        raise FileNotFoundError(src_path)
+
+    dst_dir = os.path.dirname(os.path.abspath(dst_path))
+    os.makedirs(dst_dir, exist_ok=True)
+    tmp_path = dst_path + ".sync_tmp"
+
+    src_conn = _open_sqlite_readonly(src_path)
+    try:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        dst_conn = sqlite3.connect(tmp_path)
+        try:
+            src_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+    finally:
+        src_conn.close()
+
+    if os.path.isfile(dst_path):
+        bak_path = dst_path + ".bak"
+        try:
+            if os.path.exists(bak_path):
+                os.remove(bak_path)
+            os.replace(dst_path, bak_path)
+        except Exception:
+            pass
+
+    os.replace(tmp_path, dst_path)
+
+    base = dst_path[:-3] if dst_path.lower().endswith(".db") else dst_path
+    for ext in (".db-wal", ".db-shm"):
+        wal_file = base + ext
+        if os.path.exists(wal_file):
+            try:
+                os.remove(wal_file)
+            except Exception:
+                pass
+    return True
+
+
+def sync_conversation_databases(conv_dirs=None, dry_run=False):
+    """
+    Synchronize conversation databases across discovered data directories.
+    Handles upgrades and downgrades between Antigravity versions (e.g. 2.5.5 in
+    'antigravity-ide' vs 2.6.0+ in 'antigravity') where conversations exist in
+    multiple locations with differing step counts.
+
+    For each conversation present across folders:
+    - Finds the most complete .db (highest max_idx, then count, then mtime, then size)
+    - Syncs to other existing conversation folders if missing or behind
+    Returns a list of dicts describing each sync action performed.
+    """
+    if conv_dirs is None:
+        conv_dirs = [d for d in _ALL_CONV_DIRS if os.path.isdir(d)]
+    else:
+        conv_dirs = [d for d in conv_dirs if os.path.isdir(d)]
+
+    if len(conv_dirs) < 2:
+        return []
+
+    cid_map = {}
+    for cdir in conv_dirs:
+        try:
+            for fname in os.listdir(cdir):
+                lower = fname.lower()
+                if lower.endswith(".db") and not lower.endswith((".db-shm", ".db-wal")):
+                    cid = fname[:-3]
+                    full_p = os.path.join(cdir, fname)
+                    cnt, max_idx = inspect_conversation_db(full_p)
+                    mtime = os.path.getmtime(full_p)
+                    size = os.path.getsize(full_p)
+                    if cid not in cid_map:
+                        cid_map[cid] = {}
+                    cid_map[cid][cdir] = {
+                        "path": full_p,
+                        "cnt": cnt,
+                        "max_idx": max_idx,
+                        "mtime": mtime,
+                        "size": size,
+                    }
+        except Exception:
+            continue
+
+    synced_records = []
+    for cid, folder_entries in sorted(cid_map.items()):
+        if len(folder_entries) < 1:
+            continue
+
+        best_dir, best_meta = max(
+            folder_entries.items(),
+            key=lambda item: (item[1]["max_idx"], item[1]["cnt"], item[1]["mtime"], item[1]["size"]),
+        )
+
+        for target_dir in conv_dirs:
+            if target_dir == best_dir:
+                continue
+
+            target_meta = folder_entries.get(target_dir)
+            target_path = os.path.join(target_dir, f"{cid}.db")
+
+            needs_sync = False
+            dst_steps = -1
+
+            if target_meta is None:
+                needs_sync = True
+                dst_steps = None
+            elif target_meta["max_idx"] < best_meta["max_idx"]:
+                needs_sync = True
+                dst_steps = target_meta["max_idx"]
+            elif target_meta["max_idx"] == best_meta["max_idx"] and target_meta["cnt"] < best_meta["cnt"]:
+                needs_sync = True
+                dst_steps = target_meta["cnt"]
+
+            if needs_sync:
+                if not dry_run:
+                    copy_conversation_db(best_meta["path"], target_path)
+                synced_records.append({
+                    "cid": cid,
+                    "src_path": best_meta["path"],
+                    "dst_path": target_path,
+                    "src_dir": os.path.basename(os.path.dirname(best_meta["path"])),
+                    "dst_dir": os.path.basename(os.path.dirname(target_path)),
+                    "src_steps": best_meta["max_idx"] if best_meta["max_idx"] >= 0 else best_meta["cnt"],
+                    "dst_steps": dst_steps,
+                })
+
+    return synced_records
+
+
 _USER_REQUEST_TYPES = {"USER_EXPLICIT", "USER_INPUT"}
 _REQUEST_TYPE_KEYS = (
     "type", "request_type", "message_type", "event_type", "kind", "role",
@@ -1579,6 +1752,23 @@ def main():
         print()
         print("  Make sure Antigravity has been installed and opened at least once.")
         return 1
+
+    # ── Sync conversations across data folders (upgrade/downgrade sync) ──
+
+    synced_dbs = sync_conversation_databases()
+    if synced_dbs:
+        print(f"  Synchronized {len(synced_dbs)} conversation database(s) across folders:")
+        for rec in synced_dbs:
+            cid_short = rec["cid"][:8]
+            src = rec["src_dir"]
+            dst = rec["dst_dir"]
+            src_steps = rec["src_steps"]
+            dst_steps = rec["dst_steps"]
+            if dst_steps is not None and dst_steps >= 0:
+                print(f"    [SYNC] {cid_short}: {src} ({src_steps:,} steps) -> {dst} ({dst_steps:,} steps)")
+            else:
+                print(f"    [SYNC] {cid_short}: {src} ({src_steps:,} steps) -> {dst} (new)")
+        print()
 
     # ── Discover conversations (multi-folder merge with dedup) ───────────
 

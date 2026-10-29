@@ -366,5 +366,130 @@ class CliWrapperTests(unittest.TestCase):
         prompt.assert_not_called()
 
 
+class DatabaseSyncTests(unittest.TestCase):
+    def test_inspect_conversation_db_returns_count_and_max_idx(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "test.db")
+            make_conversation_db(
+                db_path,
+                [
+                    (1, 14, title_payload("First")),
+                    (5, 15, b"second"),
+                    (12, 14, title_payload("Third")),
+                ],
+            )
+            count, max_idx = fix.inspect_conversation_db(db_path)
+            self.assertEqual(count, 3)
+            self.assertEqual(max_idx, 12)
+
+    def test_inspect_conversation_db_returns_zeros_on_missing_or_invalid_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing = os.path.join(temp_dir, "nonexistent.db")
+            count, max_idx = fix.inspect_conversation_db(missing)
+            self.assertEqual(count, 0)
+            self.assertEqual(max_idx, -1)
+
+            empty = os.path.join(temp_dir, "empty.db")
+            with open(empty, "wb") as f:
+                f.write(b"not a valid sqlite file")
+            count, max_idx = fix.inspect_conversation_db(empty)
+            self.assertEqual(count, 0)
+            self.assertEqual(max_idx, -1)
+
+    def test_copy_conversation_db_creates_clean_backup_and_preserves_data(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            src = os.path.join(temp_dir, "source.db")
+            dst = os.path.join(temp_dir, "target.db")
+
+            make_conversation_db(src, [(1, 14, title_payload("Step 1")), (2, 15, b"Step 2")])
+            make_conversation_db(dst, [(1, 14, title_payload("Old Step 1"))])
+
+            res = fix.copy_conversation_db(src, dst)
+            self.assertTrue(res)
+
+            # Target has updated content
+            count, max_idx = fix.inspect_conversation_db(dst)
+            self.assertEqual(count, 2)
+            self.assertEqual(max_idx, 2)
+
+            # Backup of old target was created
+            bak = dst + ".bak"
+            self.assertTrue(os.path.isfile(bak))
+            bak_count, _ = fix.inspect_conversation_db(bak)
+            self.assertEqual(bak_count, 1)
+
+    def test_sync_conversation_databases_propagates_newer_db_across_folders(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dir_new = os.path.join(temp_dir, "antigravity")
+            dir_old = os.path.join(temp_dir, "antigravity-ide")
+            os.makedirs(dir_new)
+            os.makedirs(dir_old)
+
+            cid = "convo-12345"
+            path_new = os.path.join(dir_new, f"{cid}.db")
+            path_old = os.path.join(dir_old, f"{cid}.db")
+
+            # dir_new has 5 steps (up to idx 5)
+            make_conversation_db(
+                path_new,
+                [(i, 14, title_payload(f"Prompt {i}")) for i in range(1, 6)],
+            )
+            # dir_old only has 2 steps (up to idx 2)
+            make_conversation_db(
+                path_old,
+                [(i, 14, title_payload(f"Prompt {i}")) for i in range(1, 3)],
+            )
+
+            actions = fix.sync_conversation_databases([dir_new, dir_old])
+
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(actions[0]["cid"], cid)
+            self.assertEqual(actions[0]["src_steps"], 5)
+            self.assertEqual(actions[0]["dst_steps"], 2)
+
+            # dir_old now has all 5 steps
+            count, max_idx = fix.inspect_conversation_db(path_old)
+            self.assertEqual(count, 5)
+            self.assertEqual(max_idx, 5)
+
+    def test_sync_conversation_databases_copies_missing_db_to_peer_folder(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dir_a = os.path.join(temp_dir, "dir_a")
+            dir_b = os.path.join(temp_dir, "dir_b")
+            os.makedirs(dir_a)
+            os.makedirs(dir_b)
+
+            cid = "convo-only-in-a"
+            path_a = os.path.join(dir_a, f"{cid}.db")
+            make_conversation_db(path_a, [(1, 14, title_payload("Sole prompt"))])
+
+            actions = fix.sync_conversation_databases([dir_a, dir_b])
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(actions[0]["cid"], cid)
+            self.assertIsNone(actions[0]["dst_steps"])
+
+            path_b = os.path.join(dir_b, f"{cid}.db")
+            self.assertTrue(os.path.isfile(path_b))
+            count, max_idx = fix.inspect_conversation_db(path_b)
+            self.assertEqual(count, 1)
+
+    def test_sync_conversation_databases_dry_run_does_not_modify_disk(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dir_a = os.path.join(temp_dir, "dir_a")
+            dir_b = os.path.join(temp_dir, "dir_b")
+            os.makedirs(dir_a)
+            os.makedirs(dir_b)
+
+            cid = "convo-dry-run"
+            path_a = os.path.join(dir_a, f"{cid}.db")
+            make_conversation_db(path_a, [(1, 14, title_payload("Dry run"))])
+
+            actions = fix.sync_conversation_databases([dir_a, dir_b], dry_run=True)
+            self.assertEqual(len(actions), 1)
+
+            path_b = os.path.join(dir_b, f"{cid}.db")
+            self.assertFalse(os.path.exists(path_b))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,7 @@ Your Antigravity conversation history disappeared? Conversations showing in the 
 | Recent `.db` messages disappear from the sidebar later | ✅ Refreshes updated timestamps on re-run *(v1.07+)* |
 | Running from WSL requires manual file copying | ✅ Native WSL path detection *(v1.05+)* |
 | `python` command fails on macOS/Linux | ✅ Auto-detects Python 3, with built-in fallback *(v1.05+)* |
+| History cut off after upgrading or downgrading Antigravity versions | ✅ Cross-folder database synchronization *(v1.08+)* |
 
 ## How It Works
 
@@ -73,6 +74,10 @@ When the index gets corrupted, conversations still exist on disk but don't show 
 | `[WS]` | Workspace metadata preserved or recovered |
 
 ## Changelog
+
+### v1.08
+- **New:** **Cross-folder conversation database sync** — when switching or downgrading between Antigravity versions (e.g. 2.5.5 in `antigravity-ide` vs 2.6.0+ in `antigravity`), conversations often end up split across multiple folders with divergent step counts. The tool now inspects conversation databases across all discovered locations, identifies the copy with the most progress (highest step index/count), and safely synchronizes it to other folders using SQLite backup APIs, creating rollback backups (`.bak`).
+- **Tests:** Added comprehensive test coverage for database step inspection, atomic SQLite backup, WAL consolidation, and multi-folder synchronization (including dry-run validation).
 
 ### v1.07
 - **Fix:** **Meaningful `.db` titles** — derives a concise title from the first user prompt when neither the existing index nor brain artifacts contain a title, replacing many date-and-ID placeholders.
