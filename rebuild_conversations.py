@@ -523,15 +523,81 @@ def build_workspace_field(folder_path):
     return encode_length_delimited(9, sub_msg)
 
 
+def sanitize_workspace_uri(uri_or_blob_text):
+    """
+    Sanitize and extract a clean workspace URI from arbitrary text or
+    corrupted workspace strings (such as strings concatenated with protobuf
+    tags or git repository info from prior buggy runs).
+    """
+    if not uri_or_blob_text:
+        return None
+    text = uri_or_blob_text.strip("'\"")
+    text = unquote(text)
+
+    # 1. Check for remote URI (vscode-remote://...)
+    m_remote = re.search(r'(vscode-remote://[^\s\x00-\x1f"\'\(\)\[\]]+)', text)
+    if m_remote:
+        return m_remote.group(1)
+
+    # 2. Check for POSIX absolute path: /Users/..., /home/..., /mnt/...
+    m_posix = re.search(
+        r'(?:file:/+)?((?:/Users|/home|/mnt|/var|/opt|/private)[^[\x00-\x1f\n\r"\'\)\(@]+)',
+        text,
+    )
+    if m_posix:
+        clean = m_posix.group(1).rstrip('/\\ ')
+        return f"file://{clean}"
+
+    # 3. Check for Windows drive path: C:/... or d:/...
+    m_win = re.search(
+        r'(?:file:///+|(?<![A-Za-z]))([A-Za-z]:/[^[\x00-\x1f\n\r"\'\)\(@]+)',
+        text,
+    )
+    if m_win:
+        clean = m_win.group(1).rstrip('/\\ ')
+        return f"file:///{clean}"
+
+    # 4. Fallback for generic file:///
+    m_generic = re.search(r'file:///+([^[\x00-\x1f\n\r"\'\)\(@]+)', text)
+    if m_generic:
+        clean = m_generic.group(1).rstrip('/\\ ')
+        if clean.startswith('/'):
+            return f"file://{clean}"
+        return f"file:///{clean}"
+
+    return None
+
+
 def extract_workspace_hint(inner_blob):
     """
-    Try to extract a workspace URI from the protobuf inner blob.
-    Scans length-delimited fields for strings matching file:/// or
-    vscode-remote:// patterns. Returns the URI string if found, or None.
+    Try to extract a clean workspace URI from the protobuf inner blob.
+    First checks Field 9 (the workspace sub-message) and its sub-fields 1 and 2.
+    Cleans up any URL encoding (%20, %3A) or corrupted nested path artifacts.
+    Returns a clean URI string if found, or None.
     """
     if not inner_blob:
         return None
     try:
+        # Check Field 9 (workspace sub-message) first
+        for f9_bytes in iter_length_delimited_fields(inner_blob, 9):
+            for sub_bytes in iter_length_delimited_fields(f9_bytes, 1):
+                try:
+                    text = sub_bytes.decode("utf-8", errors="replace")
+                    sanitized = sanitize_workspace_uri(text)
+                    if sanitized:
+                        return sanitized
+                except Exception:
+                    pass
+            for sub_bytes in iter_length_delimited_fields(f9_bytes, 2):
+                try:
+                    text = sub_bytes.decode("utf-8", errors="replace")
+                    sanitized = sanitize_workspace_uri(text)
+                    if sanitized:
+                        return sanitized
+                except Exception:
+                    pass
+
+        # Fallback: scan other length-delimited fields
         pos = 0
         while pos < len(inner_blob):
             tag, pos = decode_varint(inner_blob, pos)
@@ -541,11 +607,13 @@ def extract_workspace_hint(inner_blob):
                 l, pos = decode_varint(inner_blob, pos)
                 content = inner_blob[pos:pos + l]
                 pos += l
-                if field_num > 1:
+                if field_num > 1 and field_num != 9:
                     try:
-                        text = content.decode("utf-8", errors="strict")
-                        if "file:///" in text or "vscode-remote://" in text:
-                            return text
+                        text = content.decode("utf-8", errors="replace")
+                        if "file://" in text or "vscode-remote://" in text:
+                            sanitized = sanitize_workspace_uri(text)
+                            if sanitized:
+                                return sanitized
                     except Exception:
                         pass
             elif wire_type == 0:
@@ -1670,15 +1738,23 @@ def build_trajectory_entry(conversation_id, title, existing_inner_data=None,
         preserved_fields = strip_field_from_protobuf(existing_inner_data, 1)
         inner_info = encode_string_field(1, title) + preserved_fields
 
-        # Decode %20/%3A in existing workspace URIs so folder names display
-        # correctly in Antigravity's sidebar (e.g. "Pine Script Project" not
-        # "Pine%20Script%20Project")
+        # Normalize workspace field 9 and heal corrupt URIs from earlier buggy runs
         if not workspace_path:
             existing_ws = extract_workspace_hint(inner_info)
-            if existing_ws and ("%20" in existing_ws or "%3A" in existing_ws or "%3a" in existing_ws):
-                decoded_ws = unquote(existing_ws)
-                inner_info = strip_field_from_protobuf(inner_info, 9)
-                inner_info += build_workspace_field(decoded_ws)
+            if existing_ws:
+                cleaned_ws = sanitize_workspace_uri(existing_ws)
+                needs_heal = False
+                for f9_raw in iter_length_delimited_fields(inner_info, 9):
+                    for sub in iter_length_delimited_fields(f9_raw, 1):
+                        s = sub.decode("utf-8", errors="replace")
+                        if "%20" in s or "%3A" in s or "%3a" in s or "[" in s or "@https" in s or "\n" in s or "/[file:" in s:
+                            needs_heal = True
+                            break
+                    if needs_heal:
+                        break
+                if needs_heal and cleaned_ws:
+                    inner_info = strip_field_from_protobuf(inner_info, 9)
+                    inner_info += build_workspace_field(cleaned_ws)
 
         # Override workspace if user assigned a new one
         if workspace_path:

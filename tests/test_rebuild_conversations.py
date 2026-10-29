@@ -556,5 +556,50 @@ class DatabaseTimestampTests(unittest.TestCase):
         self.assertEqual(fix.extract_timestamp_seconds(inner, 10), real_time)
 
 
+class WorkspaceSanitizationTests(unittest.TestCase):
+    def test_sanitize_workspace_uri_heals_corrupted_nested_paths(self):
+        corrupt = (
+            r'/[file:/Users/hunghiepphamdang/Movies/Interstellar/linh tinh/antigravity-conversation-fix'
+            r'[file:/Users/hunghiepphamdang/Movies/Interstellar/linh tinh/antigravity-conversation-fixm)'
+            r'dangphuc2470/antigravity-conversation-fix@https:/github.com/dangphuc2470/antigravity-conversation-fix.git"'
+        )
+        expected = "file:///Users/hunghiepphamdang/Movies/Interstellar/linh tinh/antigravity-conversation-fix"
+        self.assertEqual(fix.sanitize_workspace_uri(corrupt), expected)
+
+    def test_sanitize_workspace_uri_unquotes_spaces_and_colons(self):
+        mac_encoded = "file:///Users/user/My%20Projects/Test%20App"
+        self.assertEqual(
+            fix.sanitize_workspace_uri(mac_encoded),
+            "file:///Users/user/My Projects/Test App",
+        )
+        win_encoded = "file:///d%3A/Repos/My%20Project"
+        self.assertEqual(
+            fix.sanitize_workspace_uri(win_encoded),
+            "file:///d:/Repos/My Project",
+        )
+
+    def test_build_trajectory_entry_heals_corrupted_field9(self):
+        corrupt = (
+            r'/[file:/Users/hunghiepphamdang/Movies/Interstellar/linh tinh/antigravity-conversation-fix'
+            r'[file:/Users/hunghiepphamdang/Movies/Interstellar/linh tinh/antigravity-conversation-fixm)'
+            r'dangphuc2470/antigravity-conversation-fix@https:/github.com/dangphuc2470/antigravity-conversation-fix.git"'
+        )
+        corrupt_f9 = fix.encode_length_delimited(
+            9,
+            fix.encode_string_field(1, corrupt) + fix.encode_string_field(2, corrupt),
+        )
+        existing = fix.encode_string_field(1, "Old title") + corrupt_f9
+        entry = fix.build_trajectory_entry("cid-test", "New title", existing)
+        inner = entry_inner_blob(entry)
+
+        f9_fields = list(fix.iter_length_delimited_fields(inner, 9))
+        self.assertEqual(len(f9_fields), 1)
+        sub1 = list(fix.iter_length_delimited_fields(f9_fields[0], 1))
+        self.assertEqual(
+            sub1[0].decode("utf-8"),
+            "file:///Users/hunghiepphamdang/Movies/Interstellar/linh tinh/antigravity-conversation-fix",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

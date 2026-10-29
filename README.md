@@ -37,6 +37,7 @@ Your Antigravity conversation history disappeared? Conversations showing in the 
 | Running from WSL requires manual file copying | ✅ Native WSL path detection *(v1.05+)* |
 | History cut off after upgrading or downgrading Antigravity versions | Yes, cross-folder database synchronization *(v1.08+)* |
 | Conversations showing 'now' due to copied/reset file timestamps (e.g. macOS) | Yes, recovers ground-truth timestamps from SQLite step metadata *(v1.08+)* |
+| Clicking conversation shows 'Path does not exist' due to corrupted workspace URI | Yes, self-healing parser extracts valid path and cleans corrupt protobuf tags *(v1.08+)* |
 
 ## How It Works
 
@@ -78,7 +79,8 @@ When the index gets corrupted, conversations still exist on disk but don't show 
 ### v1.08
 - **New:** **Cross-folder conversation database sync** — when switching or downgrading between Antigravity versions (e.g. 2.5.5 in `antigravity-ide` vs 2.6.0+ in `antigravity`), conversations often end up split across multiple folders with divergent step counts. The tool now inspects conversation databases across all discovered locations, identifies the copy with the most progress (highest step index/count), and safely synchronizes it to other folders using SQLite backup APIs, creating rollback backups (`.bak`).
 - **Fix:** **Ground-truth timestamp recovery** — when files are transferred, restored, or cloned across platforms (especially macOS), filesystem modification times often reset to the current time, causing every conversation in the sidebar to erroneously show as "now". The tool now extracts authentic timestamps directly from step protobuf metadata inside `.db` files, correctly sorting conversations by their original activity date and resetting any previous corrupt timestamps.
-- **Tests:** Added comprehensive test coverage for database step inspection, atomic SQLite backup, WAL consolidation, multi-folder synchronization, and ground-truth timestamp extraction.
+- **Fix:** **Self-healing workspace URI parser** — previously, decoding URL-encoded characters in workspace paths could mistakenly unpack raw Field 9 protobuf sub-message bytes as a UTF-8 string, concatenating binary tags, duplicate URIs, and git repository URLs into an invalid path (`/[file:...`). Clicking these conversations would result in a "Path does not exist" popup. The parser now cleanly extracts sub-fields 1 and 2 from Field 9, sanitizes any corrupted or nested path strings, and heals corrupted entries on the next run.
+- **Tests:** Added comprehensive test coverage for database step inspection, atomic SQLite backup, WAL consolidation, multi-folder synchronization, ground-truth timestamp extraction, and workspace path healing.
 
 ### v1.07
 - **Fix:** **Meaningful `.db` titles** — derives a concise title from the first user prompt when neither the existing index nor brain artifacts contain a title, replacing many date-and-ID placeholders.
